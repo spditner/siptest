@@ -27,7 +27,7 @@ To build pjsip python libraries:
         tar xjf pjproject-2.0.1.tar.bz2
         cd pjproject-2.0.1
         ./configure
-        make dep; make
+        make dep; CFLAGS=-fPIC make 
         cd pjsip-apps/src/python
         python setup.py install
 
