@@ -17,10 +17,12 @@ Formats the destination URL as sip:%(number)s@%(proxy)s;user=phone
 Requires that sox and pjsua be installed on the testing machine...
 """
 import sys, os, threading, logging, traceback, tempfile, shutil, subprocess, Queue, socket
+import time
 import logging.handlers
 import pjsua as pj
 log = logging.getLogger( __name__ )
 pjsua_log = logging.getLogger( 'pjsua' )
+transport = None
 
 SYSLOG_DEV = '/dev/log'
 SYS_FORMAT = os.path.basename(sys.argv[0]) + '[%(process)d]: %(levelname)s: %(name)s: %(message)s'
@@ -144,9 +146,10 @@ def audio_stats( file ):
         ]
     ]
     return dict( stat_lines )
+
 def start_pj( ):
     """Start PJSUA library, open a listening port"""
-    global lib
+    global lib, transport
     lib = pj.Lib()
     lib.init(
         log_cfg=pj.LogConfig(
@@ -157,10 +160,9 @@ def start_pj( ):
     )
     lib.set_null_snd_dev()
     # Choose any open port, rather than restricting to a particular port...
-    lib.create_transport(pj.TransportType.UDP)
+    transport = lib.create_transport(pj.TransportType.UDP)
     lib.start()
     return lib
-
 
 def register_account( lib, proxy,username, password ):
     """Register on proxy with given username and password"""
@@ -186,7 +188,10 @@ def make_call( lib, acc, target, play_file, record_file ):
         try:
             record_handle = lib.create_recorder( record_file )
             callback = CallCallback(None,play_handle=play_handle,record_handle=record_handle)
-            acc.make_call( target, callback)
+            call = acc.make_call(target, callback)
+#            import pdb; pdb.set_trace()
+            time.sleep(5)
+            call.dial_dtmf('1234#')
             callback.wait()
         finally:
             lib.recorder_destroy( record_handle )
@@ -226,7 +231,7 @@ def main():
     log.addHandler(sys_log)
 
     from optparse import OptionParser, OptionGroup
-    global lib
+    global lib, transport
     parser = OptionParser()
     for name, optionset in [
         ('SIP Registration', [
@@ -251,63 +256,71 @@ def main():
     options, args = parser.parse_args()
     lib = start_pj()
     try:
-        acc,acc_cb = register_account( lib, options.proxy, options.username, options.password )
-        info = acc.info()
-        print 'Status=%s (%s)'%(info.reg_status, info.reg_reason )
-        if info.reg_status != 200:
-            log.error(
-                "Unable to register in %s seconds: %s %s", REGISTER_TIMEOUT,
-                info.reg_status, info.reg_status,
-            )
-            if info.reg_status in (404,):
-                log.error( "Registration failed due to unknown account/username (Note: your service provider should have reported a 403 error (Forbidden) but reported a 404 error (Unknown) instead, this allows hostile systems to scan for accounts)." )
-                returncode = EXIT_CODE_UNKNOWN_USER
-            elif info.reg_status in (401,403):
-                log.error( "Registration failed due to authorization failure (account/username incorrect)" )
-                returncode = EXIT_CODE_BAD_PASSWORD
-            elif info.reg_status == 100:
-                host = check_proxy( options.proxy )
-                if host:
-                    # TODO: nmap -sU -p 5060 to see if the UDP port is open|filtered, but that 
-                    # requires su access to perform the scan...
-                    log.error( 'Registration failed to host: %s (%s)', options.proxy, host )
-                    returncode = EXIT_CODE_CONNECT_FAILURE_HOST_GOOD
+        if options.username and options.password:
+            acc,acc_cb = register_account( lib, options.proxy, options.username, options.password )
+            info = acc.info()
+            print 'Status=%s (%s)'%(info.reg_status, info.reg_reason )
+            if info.reg_status != 200:
+                log.error(
+                    "Unable to register in %s seconds: %s %s", REGISTER_TIMEOUT,
+                    info.reg_status, info.reg_status,
+                )
+                if info.reg_status in (404,):
+                    log.error( "Registration failed due to unknown account/username (Note: your service provider should have reported a 403 error (Forbidden) but reported a 404 error (Unknown) instead, this allows hostile systems to scan for accounts)." )
+                    returncode = EXIT_CODE_UNKNOWN_USER
+                elif info.reg_status in (401,403):
+                    log.error( "Registration failed due to authorization failure (account/username incorrect)" )
+                    returncode = EXIT_CODE_BAD_PASSWORD
+                elif info.reg_status == 100:
+                    host = check_proxy( options.proxy )
+                    if host:
+                        # TODO: nmap -sU -p 5060 to see if the UDP port is open|filtered, but that 
+                        # requires su access to perform the scan...
+                        log.error( 'Registration failed to host: %s (%s)', options.proxy, host )
+                        returncode = EXIT_CODE_CONNECT_FAILURE_HOST_GOOD
+                    else:
+                        log.error( "Unable to resolve host: %s", options.proxy )
+                        returncode = EXIT_CODE_CONNECT_FAILURE_HOST_BAD
                 else:
-                    log.error( "Unable to resolve host: %s", options.proxy )
-                    returncode = EXIT_CODE_CONNECT_FAILURE_HOST_BAD
-            else:
-                returncode = EXIT_CODE_REG_FAILURE
+                    returncode = EXIT_CODE_REG_FAILURE
         else:
-            if options.number:
-                tempdir = tempfile.mkdtemp( 'rec', 'siptest' )
-                try:
-                    record_file = os.path.join( tempdir, 'recording.wav' )
-                    
-                    call_callback = make_call( 
-                        lib,acc, 'sip:%s@%s;user=phone'%(options.number,options.proxy,),
-                        record_file = record_file,
-                        play_file = options.wav,
-                    )
-                    if call_callback.confirmed:
-                        first,second = audio_stats( options.wav), audio_stats( record_file )
-                        if abs(first['rough frequency'] - second['rough frequency']) > MAX_FREQUENCY_DELTA:
-                            if second['maximum amplitude'] == second['minimum amplitude'] == 0.0:
-                                log.error(
-                                    "Silence recorded, likely the RTP (audio) transport is blocked")
-                                returncode = EXIT_CODE_SILENCE_RECORDED
-                            else:
-                                log.error( 
-                                    "Frequencies do not match, possibly redirected to the wrong extension or a server not configured with an Echo() application? %s != %s",
-                                    first, second,
-                                )
-                                returncode = EXIT_CODE_FREQUENCY_MISMATCH_FAILURE
+            acc = lib.create_account_for_transport(transport)
+
+        if options.number:
+            tempdir = tempfile.mkdtemp( 'rec', 'siptest' )
+            try:
+                record_file = os.path.join( tempdir, 'recording.wav' )
+                uri = 'sip:%s@%s;user=phone'%(options.number,options.proxy,)
+                call_callback = make_call( 
+                    lib, acc, uri,
+                    record_file = record_file,
+                    play_file = options.wav,
+                )
+                if call_callback.confirmed:
+                    first,second = audio_stats( options.wav), audio_stats( record_file )
+                    if abs(first['rough frequency'] - second['rough frequency']) > MAX_FREQUENCY_DELTA:
+                        if second['maximum amplitude'] == second['minimum amplitude'] == 0.0:
+                            log.error(
+                                "Silence recorded, likely the RTP (audio) transport is blocked. %s, %s", first, second)
+                            returncode = EXIT_CODE_SILENCE_RECORDED
                         else:
-                            returncode = EXIT_CODE_SUCCESS
-                finally:
-                    shutil.rmtree( tempdir, True )
-            else:
-                returncode = EXIT_CODE_SUCCESS
-        acc.delete()
+                            log.error( 
+                                "Frequencies do not match, possibly redirected to the wrong extension or a server not configured with an Echo() application? %s != %s",
+                                first, second,
+                            )
+                            returncode = EXIT_CODE_FREQUENCY_MISMATCH_FAILURE
+                    else:
+                        returncode = EXIT_CODE_SUCCESS
+            finally:
+                pass # shutil.rmtree( tempdir, True )
+        else:
+            returncode = EXIT_CODE_SUCCESS
+
+        transport = None
+        # TODO(spd/2014-03-12): I'm not sure why this is being done, however it
+        # causes lib.destroy() to fail, as it tries to use acc
+        #acc.delete()
+        #acc = None
         lib.destroy()
         lib = None
         return returncode
