@@ -29,6 +29,7 @@ SYS_FORMAT = os.path.basename(sys.argv[0]) + '[%(process)d]: %(levelname)s: %(na
 
 siptest_directory = os.path.dirname( __file__ )
 DEFAULT_TEST_FILE = os.path.join( siptest_directory, 'test.wav' )
+DEFAULT_FAILURES_DIR = None
 REGISTER_TIMEOUT = 5
 
 VERBOSITY = [log.error,log.warn,log.info,log.debug]
@@ -59,10 +60,12 @@ class CallCallback(pj.CallCallback):
     # Notification when call state has changed
     queue = None
     confirmed = False 
+
     def __init__( self, call=None, play_handle=None, record_handle=None ):
         pj.CallCallback.__init__( self,call )
         self.play_handle = play_handle
         self.record_handle = record_handle
+
     def wait(self, max_wait=REGISTER_TIMEOUT):
         self.queue = Queue.Queue()
         try:
@@ -70,6 +73,7 @@ class CallCallback(pj.CallCallback):
         except Queue.Empty, err:
             # Our info will report our status as unregistered...
             pass 
+
     def on_state(self):
         info = self.call.info()
         log.info( 'Last Code: %s (%s) -> %s', info.last_code, info.last_reason, info.state_text )
@@ -91,6 +95,9 @@ class CallCallback(pj.CallCallback):
         global lib
         log.info( 'Call media state: %s', self.call.info().media_state )
         if self.call.info().media_state == pj.MediaState.ACTIVE:
+            # Send DTMF into the call
+            time.sleep(1)
+            self.call.dial_dtmf('AC1234#')
             # Get the incoming call's conference slot
             call_slot = self.call.info().conf_slot
             log.info( 'Active call media slot: %s', call_slot )
@@ -117,14 +124,25 @@ def audio_stats( file ):
     for each file.
     """
     log.info( 'Analysing %s', file )
+#    command = [
+#        'sox',
+#        file,
+#        '-n',
+#        # trim 1 second out of the middle...
+#        'trim',
+#        '00:02',
+#        '00:03',
+#        # produce frequency statistics on that period
+#        'stat',
+#        '-freq',
+#    ]
     command = [
         'sox',
         file,
         '-n',
-        # trim 1 second out of the middle...
-        'trim',
-        '00:02',
-        '00:03',
+        # trim leading and trailing silence
+        #'reverse', 'silence', '1', '0', '0', 'reverse', 'silence', '1', '0', '0',
+        'reverse', 'silence', '1', '0', '0', 'trim', '00:00', '00:02', 'reverse',
         # produce frequency statistics on that period
         'stat',
         '-freq',
@@ -189,9 +207,6 @@ def make_call( lib, acc, target, play_file, record_file ):
             record_handle = lib.create_recorder( record_file )
             callback = CallCallback(None,play_handle=play_handle,record_handle=record_handle)
             call = acc.make_call(target, callback)
-#            import pdb; pdb.set_trace()
-            time.sleep(5)
-            call.dial_dtmf('1234#')
             callback.wait()
         finally:
             lib.recorder_destroy( record_handle )
@@ -242,6 +257,7 @@ def main():
         ('RTP Audio', [
             ('number', 'Phone Number, if provided, attempt to make a call to this number, should be an Echo() application.  Note: this will be formatted as sip:<number>@<proxy>;user=phone', None),
             ('wav','Wave file to play to the Echo application (frequency analysis of this file should == capture of the call to the Echo application)', DEFAULT_TEST_FILE ),
+            ('save-failures','Location to write failed comparisons to (disabled by default)', DEFAULT_FAILURES_DIR ),
         ]),
     ]:
         group = OptionGroup( parser, name )
@@ -305,14 +321,23 @@ def main():
                             returncode = EXIT_CODE_SILENCE_RECORDED
                         else:
                             log.error( 
-                                "Frequencies do not match, possibly redirected to the wrong extension or a server not configured with an Echo() application? %s != %s",
+                                "Frequencies do not match, possibly redirected to the wrong extension or a server not configured with an Echo() application?\n\t%s\n\t!=\n\t%s",
                                 first, second,
                             )
                             returncode = EXIT_CODE_FREQUENCY_MISMATCH_FAILURE
                     else:
+                        log.info("Frequencies match.\n\t%s\n\t||\n\t%s", first, second)
                         returncode = EXIT_CODE_SUCCESS
             finally:
-                pass # shutil.rmtree( tempdir, True )
+                # Save the recording on failure
+                if returncode != 0 and options.save_failures:
+                    timestamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+                    dest_dir = os.path.join(options.save_failures, timestamp.split('-')[0])
+                    dest_file = os.path.join(dest_dir, timestamp+'-recording.wav')
+                    if not os.path.exists(dest_dir):
+                        os.makedirs(dest_dir)
+                    shutil.move(record_file, dest_file)
+                shutil.rmtree( tempdir, True )
         else:
             returncode = EXIT_CODE_SUCCESS
 
